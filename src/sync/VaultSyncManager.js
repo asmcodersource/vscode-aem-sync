@@ -13,7 +13,7 @@
         AdmZip = require('adm-zip'),
         Q = require('q'),
         Glob = require('glob'),
-        XMLDom = require('xmldom'),
+        XMLDom = require('@xmldom/xmldom'),
         XPath = require('xpath'),
         PackMgr = require('./PackMgr'),
         Filter = require('./Filter'),
@@ -27,9 +27,11 @@
         Archiver = require('archiver'),
         VaultIgnoreParser = require('./VaultIgnore');
 
-    Q.longStackSupport = true;
     var PUSH = 'push';
     var PULL = 'pull';
+    // Maximum number of files compared/copied in parallel during a pull. Keeping this
+    // bounded avoids opening thousands of file descriptors at once on large projects.
+    var COPY_CONCURRENCY = 8;
 
     /**
      * Returns the filtering path (the path after 'jcr_root/').
@@ -444,11 +446,20 @@
     }
 
     function walkSync(dir, filelist = []) {
-        Fs.readdirSync(dir).forEach(file => {
-            filelist = Fs.statSync(Path.join(dir, file)).isDirectory() ?
-                walkSync(Path.join(dir, file), filelist) :
-                filelist.concat(Path.join(dir, file));
-        });
+        var stack = [dir];
+        while (stack.length > 0) {
+            var current = stack.pop();
+            var entries = Fs.readdirSync(current, {withFileTypes: true});
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                var full = Path.join(current, entry.name);
+                if (entry.isDirectory()) {
+                    stack.push(full);
+                } else {
+                    filelist.push(full);
+                }
+            }
+        }
         return filelist;
     }
 
@@ -494,56 +505,139 @@
         return deferred.promise;
     }
 
-    function getHashForFile(file) {
-        var deferred = Q.defer();
-        var md5sum = Crypto.createHash('md5');
-        var stream = Fs.createReadStream(file);
-
-        stream.on('data', function (chunk) {
-            md5sum.update(chunk);
-        });
-
-        stream.on('end', function () {
-            deferred.resolve(md5sum.digest('hex'));
-        });
-
-        stream.on('error', function (error) {
-            deferred.reject(error);
-        });
-        return deferred.promise;
+    /**
+     * Computes the effective filter sync status for a single remote path, using the same precedence rules as
+     * {@link buildSyncStatusList}: a path is included if any filter includes it, otherwise excluded if any filter
+     * excludes it, otherwise ignored.
+     *
+     * @param {Array.<Filter>} filters the Apache Jackrabbit FileVault filters
+     * @param {String} remoteFilePath the remote path to evaluate
+     * @returns {Number} one of the {@link Constants}.sync status values
+     */
+    function getFilterStatus(filters, remoteFilePath) {
+        var result = Constants.sync.FILTER_IGNORED;
+        for (var i = 0; i < filters.length; i++) {
+            var status = filters[i].getSyncStatus(remoteFilePath);
+            if (status === Constants.sync.FILTER_INCLUDED) {
+                return Constants.sync.FILTER_INCLUDED;
+            }
+            if (result === Constants.sync.FILTER_IGNORED) {
+                result = status;
+            }
+        }
+        return result;
     }
 
     /**
-     * Prepares a map of hashes for an array of {@code files}. The map's keys are the file paths relative to the supplied {@code root}.
+     * Returns a promise resolved with the file's stats, or with <code>null</code> if the file does not exist.
      *
-     * @param {String} root the path root for which relative paths will be generated for the map's keys
-     * @param {Array.<String>} files an array of absolute file paths
-     * @returns {promise|Q.promise} a promise resolved with the map of hashes
+     * @param {String} file the file path
+     * @returns {promise|Q.promise} a promise resolved with the stats object or <code>null</code>
      */
-    function prepareHashesForFiles(root, files) {
+    function statOrNull(file) {
+        return Fs.stat(file).then(
+            function (stat) {
+                return stat;
+            },
+            function () {
+                return null;
+            }
+        );
+    }
+
+    /**
+     * Compares the contents of two files and resolves with <code>true</code> when they are identical.
+     *
+     * @param {String} a path to the first file
+     * @param {String} b path to the second file
+     * @returns {promise|Q.promise} a promise resolved with a boolean
+     */
+    function filesHaveEqualContent(a, b) {
+        return Q.all([Fs.readFile(a), Fs.readFile(b)]).spread(
+            function (bufferA, bufferB) {
+                return bufferA.length === bufferB.length && bufferA.equals(bufferB);
+            }
+        );
+    }
+
+    /**
+     * Copies <code>src</code> to <code>dest</code> only when the destination is missing or its contents differ. This avoids
+     * rewriting unchanged files (which would otherwise trigger needless editor reloads) and avoids hashing the whole tree.
+     *
+     * @param {String} src the source file
+     * @param {String} dest the destination file
+     * @returns {promise|Q.promise} a promise resolved once the file has been copied or skipped
+     */
+    function copyFileIfChanged(src, dest) {
+        return Q.all([statOrNull(src), statOrNull(dest)]).spread(
+            function (srcStat, destStat) {
+                if (!srcStat || !srcStat.isFile()) {
+                    return;
+                }
+                function write() {
+                    return Fs.ensureDir(Path.dirname(dest)).then(
+                        function () {
+                            return Fs.copy(src, dest, {overwrite: true});
+                        }
+                    );
+                }
+                if (destStat && destStat.isFile() && destStat.size === srcStat.size) {
+                    return filesHaveEqualContent(src, dest).then(
+                        function (equal) {
+                            if (!equal) {
+                                return write();
+                            }
+                        }
+                    );
+                }
+                return write();
+            }
+        );
+    }
+
+    /**
+     * Runs an asynchronous <code>worker</code> over <code>items</code> with a bounded degree of parallelism.
+     *
+     * @param {Array} items the items to process
+     * @param {Number} concurrency the maximum number of items processed in parallel
+     * @param {Function} worker a function returning a promise for a single item
+     * @returns {promise|Q.promise} a promise resolved once every item has been processed
+     */
+    function runWithConcurrency(items, concurrency, worker) {
         var deferred = Q.defer(),
-            map = {},
-            promises = [],
-            i;
-        for (i = 0; i < files.length; i++) {
-            var file = files[i];
-            if (Fs.statSync(file).isFile()) {
-                promises.push(getHashForFile(file));
+            index = 0,
+            active = 0,
+            settled = false;
+        var limit = Math.max(1, concurrency);
+
+        function schedule() {
+            if (settled) {
+                return;
+            }
+            if (index >= items.length && active === 0) {
+                settled = true;
+                deferred.resolve();
+                return;
+            }
+            while (active < limit && index < items.length) {
+                var item = items[index++];
+                active++;
+                Q.fcall(worker, item).then(
+                    function () {
+                        active--;
+                        schedule();
+                    },
+                    function (err) {
+                        if (!settled) {
+                            settled = true;
+                            deferred.reject(err);
+                        }
+                    }
+                );
             }
         }
-        Q.allSettled(promises).then(function (results) {
-            for (i = 0; i < results.length; i++) {
-                var result = results[i];
-                if (result.state === 'fulfilled') {
-                    map[Path.relative(root, files[i])] = result.value;
-                } else {
-                    deferred.reject(new Error(result.reason));
-                }
-            }
-            if (!deferred.isRejected) {
-                deferred.resolve(map);
-            }
-        });
+
+        schedule();
         return deferred.promise;
     }
 
@@ -740,9 +834,7 @@
                                             }
                                         );
                                     } else if (action === PULL) {
-                                        var zipFileName = '',
-                                            localHashes,
-                                            tempHashes;
+                                        var zipFileName = '';
                                         return createPackageMetaInf(tempFolder, remotePath, filters, 'tmp/repo', packageName,
                                             packageVersion.toString()).then(
                                             function () {
@@ -791,113 +883,79 @@
                                                             }
                                                         );
                                                     }
-                                                ).then(
-                                                    function () {
-                                                        return getFolderContents(path).then(
-                                                            function (files) {
-                                                                return prepareHashesForFiles(path, files).then(
-                                                                    function (_hashes) {
-                                                                        localHashes = _hashes;
-                                                                    }
-                                                                )
-                                                            }
-                                                        );
-                                                    }
-                                                ).then(
-                                                    function () {
-                                                        var relativeSyncPath = Path.relative(getRootPath(path), path);
-                                                        var tempSyncPath = tempFolder + Path.sep + relativeSyncPath;
-                                                        return getFolderContents(tempSyncPath).then(
-                                                            function (files) {
-                                                                return prepareHashesForFiles(tempSyncPath, files).then(
-                                                                    function (_hashes) {
-                                                                        tempHashes = _hashes;
-                                                                    }
-                                                                )
-                                                            }
-                                                        );
-                                                    }
                                                 );
                                             }
                                         ).then(
                                             function () {
                                                 excludesFilePath = tempFolder + Path.sep + '.excludes';
                                                 vaultIgnore = VaultIgnoreParser.compile(Fs.readFileSync(excludesFilePath, 'utf8'));
-                                                return buildSyncStatusList(filters, vaultIgnore,
-                                                        tempFolder + Path.sep + JCR_ROOT + filter).then(
+                                                var tempJcrRoot = tempFolder + Path.sep + JCR_ROOT;
+                                                var tempSyncRoot = tempJcrRoot + filter;
+                                                var localJcrRoot = getRootPath(path) + JCR_ROOT;
+                                                return buildSyncStatusList(filters, vaultIgnore, tempSyncRoot).then(
                                                     function (_fileSyncStatus) {
                                                         fileSyncStatus = _fileSyncStatus;
                                                     }
                                                 ).then(
                                                     function () {
-                                                        return exists(tempFolder + Path.sep + JCR_ROOT + filter).then(
-                                                            function () {
-                                                                return Fs.copy(
-                                                                    tempFolder + Path.sep + JCR_ROOT + filter,
-                                                                    path,
-                                                                    {
-                                                                        filter: function (file) {
-                                                                            var rPath = getRemotePath(file);
-                                                                            var relativePath = Path.relative(tempFolder + Path.sep + JCR_ROOT, file);
-                                                                            if (copyFilter(file, fileSyncStatus)) {
-                                                                                pathsFromRemote[rPath] = true;
-                                                                                var tempHash = tempHashes[relativePath];
-                                                                                var localHash = localHashes[relativePath];
-                                                                                if (localHash) {
-                                                                                    return !(localHash === tempHash);
-                                                                                }
-                                                                                return true;
-                                                                            }
-                                                                            return false;
-                                                                        }
-                                                                    }
-
-                                                                );
-                                                            },
-                                                            function (err) {
-                                                                /**
-                                                                 * if the file-system entry doesn't exist it means that it might have got
-                                                                 * deleted on the server; do nothing
-                                                                 */
+                                                        /*
+                                                         * Copy only the files the filters mark as included. The set of such files is
+                                                         * already known from the sync status map, so there is no need to walk the
+                                                         * extracted tree again, hash both trees or run the previous O(files^2) copy
+                                                         * filter. Each file is written locally only when its contents actually differ,
+                                                         * and the work is done with a bounded degree of parallelism.
+                                                         */
+                                                        var includedRemotePaths = [];
+                                                        for (var rp in fileSyncStatus) {
+                                                            if (fileSyncStatus.hasOwnProperty(rp) &&
+                                                                    fileSyncStatus[rp].result === Constants.sync.FILTER_INCLUDED) {
+                                                                includedRemotePaths.push(rp);
+                                                            }
+                                                        }
+                                                        return runWithConcurrency(includedRemotePaths, COPY_CONCURRENCY,
+                                                            function (remoteFilePath) {
+                                                                pathsFromRemote[remoteFilePath] = true;
+                                                                var tempFile = Path.join(tempJcrRoot, remoteFilePath);
+                                                                var localFile = Path.join(localJcrRoot, remoteFilePath);
+                                                                return copyFileIfChanged(tempFile, localFile);
                                                             }
                                                         );
                                                     }
                                                 ).then(
                                                     function () {
-                                                        return buildSyncStatusList(filters, vaultIgnore, path).then(
-                                                            function (_localFileSyncStatus) {
-                                                                return getFolderContents(path).then(
-                                                                    function (files) {
-                                                                        var i,
-                                                                            file,
-                                                                            rPath;
-                                                                        var foldersToDelete = [];
-                                                                        for (i = 0; i < files.length; i++) {
-                                                                            file = files[i];
-                                                                            rPath = getRemotePath(file);
-                                                                            if (!pathsFromRemote[rPath] && vaultIgnore.accepts(rPath.slice(1))) {
-                                                                                if (!fileIsInBasicExcludes(file)) {
-                                                                                    if (_localFileSyncStatus[rPath] !== undefined &&
-                                                                                        _localFileSyncStatus[rPath].result !== Constants.sync.FILTER_IGNORED &&
-                                                                                        _localFileSyncStatus[rPath].result !== Constants.sync.FILTER_EXCLUDED
-                                                                                    ) {
-                                                                                        fileSyncStatus[rPath] = {
-                                                                                            path: file,
-                                                                                            result: Constants.sync.DELETED_FROM_REMOTE
-                                                                                        };
-                                                                                        Fs.removeSync(file);
-                                                                                        if (Path.basename(file) === '.content.xml') {
-                                                                                            foldersToDelete.push(Path.dirname(file));
-                                                                                        }
-                                                                                    }
-                                                                                }
+                                                        /*
+                                                         * Delete local files that are covered by the filters but no longer exist on the
+                                                         * server. A single walk of the local tree is enough; the filter status for each
+                                                         * path is evaluated directly instead of building a full status map.
+                                                         */
+                                                        return getFolderContents(path).then(
+                                                            function (files) {
+                                                                var i,
+                                                                    file,
+                                                                    rPath;
+                                                                var foldersToDelete = [];
+                                                                for (i = 0; i < files.length; i++) {
+                                                                    file = files[i];
+                                                                    rPath = getRemotePath(file);
+                                                                    if (!pathsFromRemote[rPath] && vaultIgnore.accepts(rPath.slice(1)) &&
+                                                                            !fileIsInBasicExcludes(file)) {
+                                                                        var status = getFilterStatus(filters, rPath);
+                                                                        if (status !== Constants.sync.FILTER_IGNORED &&
+                                                                                status !== Constants.sync.FILTER_EXCLUDED) {
+                                                                            fileSyncStatus[rPath] = {
+                                                                                path: file,
+                                                                                result: Constants.sync.DELETED_FROM_REMOTE
+                                                                            };
+                                                                            Fs.removeSync(file);
+                                                                            if (Path.basename(file) === '.content.xml') {
+                                                                                foldersToDelete.push(Path.dirname(file));
                                                                             }
                                                                         }
-                                                                        for (i = 0; i < foldersToDelete.length; i++) {
-                                                                            Fs.removeSync(foldersToDelete[i]);
-                                                                        }
                                                                     }
-                                                                );
+                                                                }
+                                                                for (i = 0; i < foldersToDelete.length; i++) {
+                                                                    Fs.removeSync(foldersToDelete[i]);
+                                                                }
                                                             }
                                                         );
                                                     }
