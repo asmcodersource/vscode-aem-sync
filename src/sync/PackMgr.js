@@ -16,8 +16,6 @@ node:true, eqeqeq:true, strict:true, undef:true, bitwise:true, immed:true, maxle
         Path    = require('path'),
         Request = require('request');
 
-    Q.longStackSupport = true;
-
     var URL = '/crx/packmgr/service/.json';
 
     /**
